@@ -1,0 +1,1196 @@
+// DSH「通到 QQ」· 宿主半边
+//
+// 这一半只做一件事（先只做 DSH → QQ）：
+//   伙伴在「目标会话」里说完一句话（一整轮的最后一句），就自动把它发到 QQ（私聊 / 群）。
+//   发 QQ 走 NapCat 的 OneBot HTTP 接口（127.0.0.1:3000），走标准的 OneBot 11 HTTP。
+//
+// 反过来（QQ → DSH）是下一半，放到另一个插件/进程里做，不在这里混。
+//
+// ⚠ 安全默认：总开关 = false、试运行 = true —— 不手动打开，一句都不会真的发到 QQ。
+
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { randomUUID } from 'node:crypto'
+import { createSelfUpdate } from './selfupdate.mjs'
+
+export const name = 'qq-bridge'
+
+/** 需要宿主提供：webServer（路由）+ sessions/sessionTitle（目标会话清单 + 标题）+ agents（followup）+ timer（轮询收消息）+ attachments（图片）。 */
+export const inject = ['agents', 'sessions', 'sessionTitle', 'webServer', 'timer', 'workspaceRegistry', 'attachments', 'agentDefaultModel', 'sessionQuery', 'tools']
+
+// ---------- 常量 ----------
+
+const 目录 = process.env.DSH_HOME || join(homedir(), '.dsh')
+const 配置文件 = join(目录, 'qq-bridge-config.json')
+const 路由前缀 = '/dsh-qq-bridge'
+const 日志上限 = 60
+
+const 默认配置 = {
+  总开关: false, // 关着 = 一句都不发（安全默认）
+  试运行: true, // 开着 = 只记账、不真发到 QQ
+  目标会话: '', // 盯哪个 DSH 会话（在设置页下拉里选，一般是你平时聊天的那一间）
+  私聊QQ: '', // 发到哪个私聊（QQ 号，字符串）
+  群号: '', // 发到哪个群（可空；只在下面的「绑定」表为空时才用）
+  绑定: [], // ⭐ 多 QQ 会话绑定表：每行 { 名, 类型:'private'|'group', 号, 目标会话, 收, 发, 试运行, 只认, 潜水, 自动发, 收档, 半收分钟 }
+  工具: true, // ⭐ 给她/他一个「发到 QQ」的工具（qq_say）：不调它就不发话 —— 群里「说不说」由它自己决定
+  转私聊: true,
+  转群: false,
+  NapCat: 'http://127.0.0.1:3000', // OneBot HTTP 接口
+  令牌: '', // ⭐ OneBot 访问令牌：填了就每个请求带 Authorization: Bearer <令牌>；留空＝不带
+  // ⭐ 2026-10-22：图片两个方向
+  收图: true, // QQ → DSH：她发的图片也转进来
+  收图最多: 4, // 一条消息最多转几张
+  发图: true, // DSH → QQ：伙伴发的图片也发过去
+  图上限MB: 5, // 单张最大多少 MB（两个方向共用）
+  图片根目录: '', // 正文里 `![名字](相对路径)` 按哪个目录去找（留空 = 自动猜）
+  称呼: '对方', // ⭐ 跟它说话的那个人怎么称呼（写进转给它的文案里，比如「小明发来了图片」）
+}
+
+/** 版本从 package.json 读。 */
+const 版本 = (() => {
+  try {
+    const p = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8'))
+    return String(p.version || '?')
+  } catch (error) {
+    return '?'
+  }
+})()
+
+// ---------- 配置读写 ----------
+
+function 布(值, 兜) {
+  if (值 === true || 值 === 'true' || 值 === 1 || 值 === '1') return true
+  if (值 === false || 值 === 'false' || 值 === 0 || 值 === '0') return false
+  return 兜
+}
+
+function 归一化(原始) {
+  const 是对象 = 原始 && typeof 原始 === 'object' && !Array.isArray(原始)
+  const 混 = 是对象 ? { ...默认配置, ...原始 } : { ...默认配置 }
+  const 字 = (v) => (typeof v === 'string' ? v.trim() : '')
+  const 数 = (v, 兜, 低, 高) => {
+    const n = Math.round(Number(v))
+    if (!Number.isFinite(n)) return 兜
+    return Math.max(低, Math.min(n, 高))
+  }
+  return {
+    总开关: 布(混.总开关, 默认配置.总开关),
+    试运行: 布(混.试运行, 默认配置.试运行),
+    目标会话: 字(混.目标会话),
+    私聊QQ: 字(混.私聊QQ),
+    群号: 字(混.群号),
+    绑定: Array.isArray(混.绑定) ? 混.绑定.filter((b) => b && typeof b === 'object' && !Array.isArray(b)).map((b) => ({ ...b })) : [],
+    转私聊: 布(混.转私聊, 默认配置.转私聊),
+    转群: 布(混.转群, 默认配置.转群),
+    NapCat: 字(混.NapCat) || 默认配置.NapCat,
+    令牌: 字(混.令牌),
+    工具: 布(混.工具, 默认配置.工具),
+    预设: 字(混.预设),
+    会话目录: 字(混.会话目录),
+    收图: 布(混.收图, 默认配置.收图),
+    发图: 布(混.发图, 默认配置.发图),
+    收图最多: 数(混.收图最多, 默认配置.收图最多, 1, 10),
+    图上限MB: 数(混.图上限MB, 默认配置.图上限MB, 1, 30),
+    图片根目录: 字(混.图片根目录),
+    称呼: 字(混.称呼) || 默认配置.称呼,
+  }
+}
+
+// ---------- 图片小工具（两个方向共用）----------
+// ⭐ 2026-10-22 加：QQ 的图片段（OneBot）可能给 http url、本地路径、base64 三种形态，
+//    这里统一成字节；大小和类型都在收的时候判，判不了就当 jpeg。
+
+/** 收进来的图存一份到这儿（纯文本模型看不见图，至少能从文字里找到路径） */
+/**
+ * ⭐ 2026-10-23：会话 id 有两种写法（`xxx` / `session-xxx`）。找agent 两种都认，
+ *    但事件过滤、归档判断、设置页高亮这些地方原来是**字面比较** ⇒ 存的是裸 id 时就对不上。
+ *    统一用「去掉 session- 前缀」的键来比。
+ */
+const 会话键 = (v) => {
+  const s = String(v == null ? '' : v).trim()
+  return s.startsWith('session-') ? s.slice('session-'.length) : s
+}
+
+/**
+ * ⭐ 多 QQ 会话绑定表：每行 = 一个 QQ 会话（私聊或群）→ 一间 DSH 会话。
+ *   表为空时，把老的「单目标」配置当成分一行用（老配置无缝照旧）。
+ */
+// ⭐ 2026-10-24：「半收」窗口用 —— 它刚在某个群里说过话，那之后的几句也算接着它说的
+const 上次出声 = new Map()
+const 绑键 = (绑) => 会话键(绑 && 绑.目标会话) + '|' + String((绑 && 绑.类型) || '') + ':' + String((绑 && 绑.号) || '')
+function 记出声(绑) {
+  try { 上次出声.set(绑键(绑), Date.now()) } catch (error) {}
+  try { 上次出声.set(String((绑 && 绑.号) || ''), Date.now()) } catch (error) {}
+}
+function 最近说过话(绑) {
+  let t = 0
+  try { t = Number(上次出声.get(绑键(绑)) || 上次出声.get(String((绑 && 绑.号) || '')) || 0) } catch (error) {}
+  if (!t) return false
+  const 分钟 = Number(绑 && 绑.半收分钟) > 0 ? Number(绑.半收分钟) : 5
+  return Date.now() - t < 分钟 * 60000
+}
+/** 工具模式下，给投进去的话加一句「不一定要接」的交代。 */
+function 加提示(文字, 绑) {
+  if (!绑 || 绑.自动发 !== false) return 文字
+  const 词 = 绑.类型 === 'group' ? '群里的话' : '对方的话'
+  return String(文字 || '') + '\n\n（' + 词 + '不一定要接：想说话就在这一轮里调用 qq_say 把它发出去；不想说就什么都不用做，正常收尾即可。）'
+}
+
+function 绑定们(配置) {
+  const 行 = Array.isArray(配置 && 配置.绑定) ? 配置.绑定 : []
+  const 净 = []
+  for (const b of 行) {
+    if (!b || typeof b !== 'object') continue
+    const 类型 = b.类型 === 'group' ? 'group' : 'private'
+    const 号 = String(b.号 == null ? '' : b.号).trim()
+    const 目标会话 = String(b.目标会话 == null ? '' : b.目标会话).trim()
+    if (!号 || !目标会话) continue
+    净.push({
+      名: String(b.名 || (类型 === 'group' ? '群' : '私聊') + 号),
+      类型, 号, 目标会话,
+      收: b.收 !== false, 发: b.发 !== false,
+      试运行: b.试运行 !== false,
+      只认: String(b.只认 == null ? '' : b.只认).trim(),
+      潜水: b.潜水 === true,
+      自动发: b.自动发 !== false, // false = 不自动发收尾句（等它自己调 qq_say）
+      收档: ['点名', '半收', '全收'].indexOf(b.收档) >= 0 ? b.收档 : (b.潜水 === true ? '点名' : '全收'),
+      半收分钟: (function () { const n = Math.round(Number(b.半收分钟)); return Number.isFinite(n) && n > 0 ? Math.min(n, 240) : 5 })(),
+    })
+  }
+  if (净.length) return 净
+  const 老目标 = String((配置 && 配置.目标会话) || '').trim()
+  if (!老目标) return []
+  const 出 = []
+  if (配置.转私聊 !== false && 配置.私聊QQ) 出.push({ 名: '私聊' + 配置.私聊QQ, 类型: 'private', 号: String(配置.私聊QQ), 目标会话: 老目标, 收: true, 发: true, 试运行: 配置.试运行 !== false, 只认: '', 潜水: false })
+  if (配置.转群 === true && 配置.群号) 出.push({ 名: '群' + 配置.群号, 类型: 'group', 号: String(配置.群号), 目标会话: 老目标, 收: true, 发: true, 试运行: 配置.试运行 !== false, 只认: '', 潜水: false })
+  return 出
+}
+
+/** 这个 DSH 会话是哪一行的目标？（没绑就不转） */
+function 找绑定(配置, 会话id) {
+  const 键 = 会话键(会话id)
+  for (const b of 绑定们(配置)) if (会话键(b.目标会话) === 键) return b
+  return null
+}
+
+/** 潜水用：这句话里有没有点我们名（@ 或称呼） */
+function 点名了(文字, 称呼) {
+  const t = String(文字 || '')
+  if (/\[@＠]/.test(t)) return true
+  if (t.indexOf('2894402627') >= 0) return true   // ⭐ @ 她时 OneBot 的 @ 段里带她的号
+  if (t.indexOf('鲸鱼娘') >= 0) return true        // ⭐ 群里直接叫名字也算点名
+  const c = String(称呼 || '').trim()
+  return !!c && t.indexOf(c) >= 0
+}
+
+const 收图目录 = join(目录, 'qq-bridge-inbox')
+
+/**
+ * ⭐ 2026-10-22：DSH 存图时会留一份「归一化副本」（官方文档原话：may be resized or re-encoded），
+ *    GIF 到这一步就变成静态 webp 了 —— 所以回发时必须用**我们自己留的原图**。
+ *    这张表记「附件 id → 我们存的原图路径」，回发时先查它。
+ */
+const 收图表 = join(目录, 'qq-bridge-received.json')
+
+function 读收图表() {
+  try {
+    const j = JSON.parse(readFileSync(收图表, 'utf8'))
+    return j && typeof j === 'object' && !Array.isArray(j) ? j : {}
+  } catch (error) {
+    return {}
+  }
+}
+
+/** 路径统一：去掉两头引号/空格，Windows 下大小写不敏感 */
+const 清路径 = (p) => String(p || '').trim().replace(/^["']+|["']+$/g, '').trim()
+
+/**
+ * 记「附件 / DSH 那份只读副本 → 我们存的原图」。
+ * ⚠ 两个键都要记：伙伴回发时可能用附件 id（附件块），也可能照抄 DSH 给的那条
+ *   只读副本路径（正文里的 markdown 图）—— 后者是常见情况，第一次就漏了。
+ */
+function 记收图(附件id, 副本路径, 原图路径) {
+  const 原 = String(原图路径 || '').trim()
+  if (!原) return
+  const id = String(附件id || '').trim()
+  const 副 = 清路径(副本路径)
+  if (!id && !副) return
+  try {
+    const 表 = 读收图表()
+    const 记 = { p: 原, t: Date.now() }
+    if (id) 表['id:' + id] = 记
+    if (副) 表['p:' + 副.toLowerCase()] = 记
+    // 只留最近 200 条，别让这个文件无限长
+    const 留 = Object.entries(表).sort((a, b) => Number((b[1] && b[1].t) || 0) - Number((a[1] && a[1].t) || 0)).slice(0, 200)
+    writeFileSync(收图表, JSON.stringify(Object.fromEntries(留)), 'utf8')
+  } catch (error) {}
+}
+
+/** 这张图能不能换回原图？键可以是 `id:<附件id>`，也可以是 `p:<副本路径>` */
+function 原图路径(键) {
+  const k = String(键 || '').trim()
+  if (!k) return ''
+  const 表 = 读收图表()
+  const 记 = 表[k] || 表[k.toLowerCase()] || 表[String(k).replace(/^id:/, '')]
+  const p = 记 && typeof 记.p === 'string' ? 记.p : ''
+  if (!p) return ''
+  try { return existsSync(p) ? p : '' } catch (error) { return '' }
+}
+
+const 扩展 = (类) => (类 === 'image/png' ? 'png' : 类 === 'image/gif' ? 'gif' : 类 === 'image/webp' ? 'webp' : 'jpg')
+
+function 看图类(字节) {
+  try {
+    if (字节[0] === 0x89 && 字节[1] === 0x50) return 'image/png'
+    if (字节[0] === 0x47 && 字节[1] === 0x49) return 'image/gif'
+    if (字节[0] === 0x52 && 字节[1] === 0x49 && 字节[8] === 0x57) return 'image/webp'
+  } catch (error) {}
+  return 'image/jpeg'
+}
+
+/** 从 OneBot 的图片段里把字节抠出来：url → file(本地/base64://) 依次试 */
+async function 取图字节(数据) {
+  const d = 数据 || {}
+  const url = typeof d.url === 'string' ? d.url.trim() : ''
+  if (url) {
+    if (url.startsWith('file://')) {
+      try { return readFileSync(new URL(url)) } catch (error) {}
+    } else if (/^https?:/i.test(url)) {
+      try {
+        const r = await fetch(url)
+        if (r.ok) return Buffer.from(await r.arrayBuffer())
+      } catch (error) {}
+    }
+  }
+  const f = typeof d.file === 'string' ? d.file.trim() : ''
+  if (f.startsWith('base64://')) {
+    try { return Buffer.from(f.slice('base64://'.length), 'base64') } catch (error) {}
+  }
+  if (f && (f.includes('\\') || f.includes('/'))) {
+    try { return readFileSync(f) } catch (error) {}
+  }
+  return null
+}
+
+/** 存一份到收图目录，返回路径（存不下就返回空串，不影响转图） */
+function 存一张(名字, 字节, 类) {
+  try {
+    mkdirSync(收图目录, { recursive: true })
+    const p = join(收图目录, `${名字}.${扩展(类)}`)
+    writeFileSync(p, 字节)
+    return p
+  } catch (error) {
+    return ''
+  }
+}
+
+function 读配置() {
+  try {
+    return 归一化(JSON.parse(readFileSync(配置文件, 'utf8')))
+  } catch (error) {
+    return 归一化(null)
+  }
+}
+
+function 写配置(配置) {
+  try {
+    mkdirSync(目录, { recursive: true })
+    writeFileSync(配置文件, JSON.stringify(配置, null, 2), 'utf8')
+    return true
+  } catch (error) {
+    return false
+  }
+}
+
+// ---------- 纯函数（导出给冒烟测试喂） ----------
+
+/** 从一条 assistant 消息里只抽出正文（text 块拼起来；reasoning / image 都不要）。 */
+export function 提取正文(message) {
+  if (!message || !Array.isArray(message.content)) return ''
+  return message.content
+    .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+    .map((b) => b.text)
+    .join('\n')
+    .trim()
+}
+
+/** 拼一个 OneBot「私聊 text 段」消息体。 */
+export function 私人消息体(text) {
+  return { user_id: 0, message: [{ type: 'text', data: { text } }] }
+}
+
+/** 拼一个 OneBot「群 text 段」消息体。 */
+export function 群消息体(text) {
+  return { group_id: 0, message: [{ type: 'text', data: { text } }] }
+}
+
+/** ⭐ 2026-10-22：从一条 assistant 消息里挑出图片块（要发到 QQ 的那几张）。 */
+export function 提取图块(message) {
+  if (!message || !Array.isArray(message.content)) return []
+  return message.content.filter((b) => b && b.type === 'image' && b.attachment).slice(0, 10)
+}
+
+/** 拼一个 OneBot「图片段」（base64 直接塞，不依赖 QQ 那边能不能访问本地文件）。 */
+export function 图片段(base64) {
+  return { type: 'image', data: { file: 'base64://' + String(base64) } }
+}
+
+/**
+ * ⭐ 2026-10-22：正文里那种 markdown 图片 `![名字](路径)` 也当图片发。
+ *    伙伴发贴纸就是这么发的（`![小肥鱼](_stickers/feiyu-test.webp)`）——
+ *    以前只认附件块，这种一律被当成普通文字发过去，QQ 那边看到的是一串 markdown。
+ * @returns {净文字, 图: [{kind:'url'|'path', value}]}
+ */
+export function 抠正文图(文字) {
+  const 图 = []
+  const 净文字 = String(文字 || '')
+    .replace(/!\[[^\]]*\]\(\s*([^)\s]+)\s*\)/g, (全, 路径) => {
+      const p = String(路径 || '').trim()
+      if (!p) return ''
+      if (/^https?:\/\//i.test(p)) {
+        if (!图.some((x) => x.value === p)) 图.push({ kind: 'url', value: p })
+        return ''
+      }
+      if (!图.some((x) => x.value === p)) 图.push({ kind: 'path', value: p })
+      return ''
+    })
+    .replace(/[ \t]+$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+  return { 净文字, 图 }
+}
+
+// 包根：用来读自己的 package.json（版本 + 仓库地址）
+const 包根 = join(dirname(fileURLToPath(import.meta.url)), '..')
+
+export function apply(ctx) {
+  // ⭐ 设置页那个「检查更新」：查这个插件自己的仓库
+  createSelfUpdate({ packageRoot: 包根, diag: 记账 }).register(ctx, 路由前缀)
+  // ---------- 状态 ----------
+
+  const 日志 = []
+  // ⚠ 2026-10-23 修（反馈：换过「目标会话」之后，新会话第 2 轮起就静默不发）
+  //   真因：这两个表原来都是**全局一份**，只认「轮号」，不认「哪个会话」。
+  //     从 A 换到 B 之后，B 的轮号一旦跟 A 撞上，就被当成「这轮已经发过了」跳过；
+  //     而调用处是 `void 落地一发(...)`，没有日志 → 日志里一片空白，很难查。
+  //   → 现在都按会话分开：上一轮按会话键存一份；已发的键是「会话键:轮号」。
+  const 空轮 = () => ({ 轮号: -1, 文本: '', 图们: [] })
+  const 上一轮们 = new Map() // 会话键 -> { 轮号, 文本, 图们 }
+  const 已发轮 = new Set() // 「会话键:轮号」
+  const 已转消息 = new Set() // 已经转发进 DSH 的 QQ 消息 id（防重复转）
+  // ⭐ 多绑定：每个 QQ 会话（`类型:号`）各留一个游标 —— 从现在起只认新消息，不补旧的
+  const 上次时间 = new Map()
+  const 待转 = new Map() // ⭐ 没投进去的消息先存这儿（目标会话没活着时不吞掉，等它活了补投）
+  // ⭐ 2026-10-24 回声修复：NapCat 的历史里也有「我们自己发出去的话」，不挡住就会自己被自己投一遍
+  const 自己发的 = new Set() // 我们发出去的 QQ 消息 id
+  let 自己号 = 0 // 本机这个 QQ 号（鲸鱼娘），兜底把「她自己的话」全挡掉
+  const 状态文件 = join(目录, 'qq-bridge-seen.json')
+
+  /** 上次读到哪、转过哪些、自己发过哪些 —— 都落盘，重启后不重复投、也不回声。 */
+  function 读状态() {
+    try {
+      const j = JSON.parse(readFileSync(状态文件, 'utf8'))
+      for (const x of (Array.isArray(j.已转) ? j.已转 : [])) 已转消息.add(String(x))
+      for (const x of (Array.isArray(j.自己发的) ? j.自己发的 : [])) 自己发的.add(String(x))
+      const 表 = (j.上次 && typeof j.上次 === 'object') ? j.上次 : {}
+      for (const k of Object.keys(表)) 上次时间.set(k, Number(表[k]) || 0)
+      记账(`状态载入：已转 ${已转消息.size} 条 / 自己发过 ${自己发的.size} 条 / 游标 ${上次时间.size} 个`)
+    } catch (error) {}
+  }
+  function 存状态() {
+    try {
+      mkdirSync(目录, { recursive: true })
+      const 收 = (集, 限) => { const 全 = [...集]; return 全.length > 限 ? 全.slice(全.length - 限) : 全 }
+      writeFileSync(状态文件, JSON.stringify({
+        已转: 收(已转消息, 600), 自己发的: 收(自己发的, 300),
+        上次: Object.fromEntries([...上次时间].slice(-20)),
+        at: Math.floor(Date.now() / 1000),
+      }), 'utf8')
+    } catch (error) {}
+  }
+  /** 认一下自己的 QQ 号（挪不过去的话退回 0，不影响用「自己发的」挡回声）。 */
+  async function 认自己号() {
+    try {
+      const j = await 发一个(读配置().NapCat, 'get_login_info', {})
+      const id = j && j.数据 && j.数据.data && j.数据.data.user_id
+      if (id) 自己号 = Number(id)
+    } catch (error) {}
+  }
+  读状态()
+  void 认自己号()
+
+  function 记账(文本) {
+    const d = new Date()
+    const 补 = (n) => String(n).padStart(2, '0')
+    const 时间 = `${补(d.getMonth() + 1)}-${补(d.getDate())} ${补(d.getHours())}:${补(d.getMinutes())}:${补(d.getSeconds())}`
+    日志.push({ 时间, 文本 })
+    if (日志.length > 日志上限) 日志.shift()
+    try {
+      ctx.logger?.info(`qq-bridge: ${文本}`)
+    } catch (error) {}
+  }
+
+  /** ⭐ 认证头：填了令牌就带 Bearer；留空＝只有 content-type（跟以前一样）。读配置() 是函数声明，已提升。 */
+  function 认证头(配置) {
+    const t = String((配置 && 配置.令牌) || 读配置().令牌 || '').trim()
+    const h = { 'content-type': 'application/json' }
+    if (t) h.authorization = `Bearer ${t}`
+    return h
+  }
+
+  async function 发一个(base, action, 体) {
+    try {
+      const r = await fetch(`${base}/${action}`, {
+        method: 'POST',
+        headers: 认证头(),
+        body: JSON.stringify(体),
+      })
+      const j = await r.json()
+      const 好了 = !!(j && j.status === 'ok' && j.retcode === 0)
+      if (好了) {
+        const id = j && j.data && j.data.message_id
+        if (id !== undefined && id !== null) { 自己发的.add(String(id)); 存状态() }
+      }
+      return { action, ok: 好了, 数据: j }
+    } catch (error) {
+      return { action, ok: false, 数据: { 错: String((error && error.message) || error) } }
+    }
+  }
+
+  /** 把一段长文字按空行拆成自然段（没有空行就整段）。 */
+  function 按段拆(文字) {
+    const 段 = String(文字 || '')
+      .split(/\n\s*\n/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+    return 段
+  }
+
+  /**
+   * 相对路径的图按哪儿找：
+   *   ① 设置里的「图片根目录」（填了就以它为准）
+   *   ② **目标会话所在的那个工作区**（自动的，一般不用填）
+   *   ③ 其它登记过的工作区
+   *   ④ 进程当前目录 ⑤ <DSH_HOME>/workspace ⑥ 用户主目录
+   * 找到就返回绝对路径。
+   */
+  function 找本地图(p, 配置) {
+    const 原 = String(p || '').trim()
+    if (!原) return ''
+    const 试 = []
+    if (/^[a-zA-Z]:[\\/]/.test(原) || 原.startsWith('\\\\') || 原.startsWith('/')) 试.push(原)
+    else {
+      const 根们 = []
+      const 设 = String(配置.图片根目录 || '').trim()
+      if (设) 根们.push(设)
+      try {
+        const 登记 = ctx.workspaceRegistry || ctx.get('workspaceRegistry')
+        const 列表 = (登记 && typeof 登记.list === 'function' ? 登记.list() : []) || []
+        const 目标 = String(配置.目标会话 || '')
+        // ⭐ 先把「目标会话所在的工作区」排到前面 —— 这个才是它平时待的地方
+        const 排 = 列表.slice().sort((a, b) => {
+          const A = a && Array.isArray(a.sessionIds) && a.sessionIds.map(String).indexOf(目标) >= 0 ? 0 : 1
+          const B = b && Array.isArray(b.sessionIds) && b.sessionIds.map(String).indexOf(目标) >= 0 ? 0 : 1
+          return A - B
+        })
+        for (const w of 排) {
+          const d = w && (typeof w.path === 'string' ? w.path : (w.directory || w.dir || w.root))
+          if (typeof d === 'string' && d) 根们.push(d)
+        }
+      } catch (error) {}
+      根们.push(process.cwd(), join(目录, 'workspace'), homedir())
+      for (const r of 根们) 试.push(join(String(r), 原))
+    }
+    for (const 全 of 试) {
+      try { if (existsSync(全)) return 全 } catch (error) {}
+    }
+    记账('找不到这张图：' + 原 + '（试过：' + 试.slice(0, 4).join(' ｜ ') + ' 等 ' + 试.length + ' 个位置；可在设置里填「图片根目录」）')
+    return ''
+  }
+
+  /** 把一句正文发到该发的地方（私聊 / 群）；按空行拆段，一段一条连发。⭐ 末尾再加上图片。 */
+  async function 发到QQ(配置, 绑, 原文字, 图们) {
+    const 出 = []
+    // ⭐ 正文里的 markdown 图（贴纸就是这么发的）也当图片发；抠掉之后正文更干净
+    const 抠过 = 配置.发图 ? 抠正文图(原文字) : { 净文字: String(原文字 || ''), 图: [] }
+    const 文字 = 抠过.净文字
+    const 段们 = 按段拆(文字).length ? 按段拆(文字) : [String(文字 || '').trim()].filter((s) => s.length > 0)
+    const 发段延迟 = 450 // 每段之间隔一下，像真人一条条发
+    const 最大 = Math.max(1, Math.min(Number(配置.图上限MB) || 5, 30)) * 1024 * 1024
+    // ⭐ 图片：base64 或网络地址，QQ 那边直接收，不用访问本机文件
+    const 图数据 = []
+    const 加图 = (源) => {
+      if (!源 || 图数据.length >= 4) return
+      if (源.kind === 'url') { 图数据.push({ url: 源.value }); return }
+      let 值 = 源.value
+      // ⭐ 伙伴回发时常常照抄 DSH 给的那条「只读副本」路径（webp）——
+      //    先反查一次表，能换回我们存的原图就换（GIF 才是动的）
+      const 换 = 原图路径('p:' + 清路径(值).toLowerCase())
+      if (换) 值 = 换
+      const 全 = 找本地图(值, 配置) || 值
+      try {
+        const buf = readFileSync(全)
+        if (buf.length > 最大) { 记账(`这张图太大（${Math.round(buf.length / 1048576)}MB），跳过`); return }
+        图数据.push({ b64: buf.toString('base64') })
+      } catch (error) {
+        记账('读图失败，跳过：' + String((error && error.message) || error))
+      }
+    }
+    if (配置.发图) {
+      for (const 源 of 抠过.图) 加图(源)
+      if (Array.isArray(图们) && 图们.length) {
+        const 附件 = ctx.attachments || ctx.get('attachments')
+        for (const 块 of 图们) {
+          try {
+            // ⭐ 优先用我们收下来的**原图**（DSH 那份副本会被转码，GIF 会变静态）
+            const 原 = 原图路径('id:' + String((块.attachment && 块.attachment.attachmentId) || ''))
+            if (原) { 加图({ kind: 'path', value: 原 }); continue }
+            const p = 附件 && typeof 附件.imageHostPath === 'function' ? 附件.imageHostPath(块.attachment) : undefined
+            if (!p) { 记账('这张图拿不到本地文件，跳过'); continue }
+            加图({ kind: 'path', value: p })
+          } catch (error) {
+            记账('读图失败，跳过：' + String((error && error.message) || error))
+          }
+        }
+      }
+    }
+    // 一条 OneBot 图片段：本地图走 base64，网络图直接把 url 交给 QQ
+    const 一段图 = (x) => (x.url ? { type: 'image', data: { file: x.url, url: x.url } } : 图片段(x.b64))
+
+    if (绑.发) {
+      const 是群 = 绑.类型 === 'group'
+      const 动作 = 是群 ? 'send_group_msg' : 'send_private_msg'
+      const 键名 = 是群 ? 'group_id' : 'user_id'
+      const 段体 = (t) => { const b = 是群 ? 群消息体(t) : 私人消息体(t); b[键名] = Number(绑.号); return b }
+      for (let i = 0; i < 段们.length; i++) {
+        出.push(await 发一个(配置.NapCat, 动作, 段体(段们[i])))
+        if (i < 段们.length - 1) await new Promise((r) => setTimeout(r, 发段延迟))
+      }
+      for (const x of 图数据) {
+        出.push(await 发一个(配置.NapCat, 动作, { [键名]: Number(绑.号), message: [一段图(x)] }))
+        await new Promise((r) => setTimeout(r, 发段延迟))
+      }
+    }
+
+    return 出
+  }
+
+  /** 一轮真正落地：总开关 / 试运行 在这儿把关。 */
+  async function 落地一发(配置, 绑, 文字, 图们) {
+    if (已发轮.size > 300) 已发轮.clear() // 防 Set 无限长
+    if (!绑) return 记账('这一轮不属于任何一条绑定，不转')
+    // ⭐ 盯的会话已经归档了：别转（人已经不在这儿说话了）
+    try {
+      const 登记 = ctx.workspaceRegistry || ctx.get('workspaceRegistry')
+      const 归档 = new Set((((登记 && 登记.archivedSessionIds) || [])).map(String))
+      if (归档.has(会话键(绑.目标会话))) return 记账('「' + 绑.名 + '」的目标会话已经归档了，这轮不转（去设置里换一个）')
+    } catch (error) {}
+    if (!配置.总开关) return 记账('总开关关着，这轮该转但没转')
+    if (绑.自动发 === false) return 记账('「' + 绑.名 + '」关着自动发：这一轮没自动发（等它自己决定、自己调 qq_say）')
+    const 抠过 = 配置.发图 ? 抠正文图(文字) : { 净文字: 文字, 图: [] }
+    const 几张 = (Array.isArray(图们) ? 图们.length : 0) + 抠过.图.length
+    const 图标 = 几张 ? `（还有 ${几张} 张图）` : ''
+    const 净文 = String(抠过.净文字 || '')
+    if (绑.试运行) {
+      return 记账(`试运行：本来要发到 QQ →「${净文.slice(0, 40)}${净文.length > 40 ? '…' : ''}」${图标}`)
+    }
+    const 结果 = await 发到QQ(配置, 绑, 文字, 图们)
+    const 全过 = 结果.length > 0 && 结果.every((r) => r.ok)
+    if (结果.length === 0) {
+      记账('这一行绑定的「发」关着，或者这轮既没有文字也没有图：没地方发')
+      return
+    }
+    if (全过) 记出声(绑)
+    记账(`${全过 ? '✅ 已发到 QQ：' : '⚠ 发 QQ 有问题：'}「${净文.slice(0, 50)}${净文.length > 50 ? '…' : ''}」${图标}`)
+    for (const r of 结果) {
+      if (!r.ok) 记账(`   ${r.action} 失败：${JSON.stringify(r.数据).slice(0, 140)}`)
+    }
+  }
+
+  /** 盯会话事件：记住这一轮最后一句，在 turn/end 时落地。 */
+  function 收到事件(session, event) {
+    const 配置 = 读配置()
+    const 键 = 会话键(session && session.id)
+    const 绑 = 找绑定(配置, 键)
+    if (!绑) return
+    // 这一轮的「最后一句」按会话分开记（两个会话同时说话时不会串）
+    const 上一轮 = 上一轮们.get(键) || 空轮()
+    const 记上一轮 = (v) => 上一轮们.set(键, v)
+
+    if (event && event.type === 'assistant/message') {
+      const d = event.data || {}
+      if (d.interrupted) {
+        记上一轮(空轮())
+        return
+      }
+      const 文 = String(提取正文(d.message) || '').trim()
+      const 图们 = 提取图块(d.message)
+      if (文) 记上一轮({ 轮号: d.turn, 文本: 文, 图们 })
+      // ⭐ 有的回合是先出图、后出字（或只出图）：别把图丢了
+      else if (图们.length) 记上一轮({ 轮号: d.turn, 文本: 上一轮.轮号 === d.turn ? 上一轮.文本 : '', 图们: (上一轮.轮号 === d.turn ? 上一轮.图们 : []).concat(图们).slice(0, 10) })
+      return
+    }
+
+    if (event && event.type === 'turn/end') {
+      const d = event.data || {}
+      const 完成 = !!(d.reason && d.reason.kind === 'completed')
+      const 有东西 = 上一轮.文本 || (上一轮.图们 && 上一轮.图们.length)
+      // ⚠ 去重的键必须是「会话 + 轮号」：只按轮号的话，换过目标会话就会静默漏发
+      const 轮标 = 键 + ':' + String(d.turn)
+      if (完成 && 上一轮.轮号 === d.turn && 有东西 && !已发轮.has(轮标)) {
+        已发轮.add(轮标)
+        void 落地一发(配置, 绑, 上一轮.文本, 上一轮.图们)
+      }
+      记上一轮(空轮())
+    }
+  }
+
+  // ---------- 路由（将来给设置页用；现在也能用来手动试） ----------
+
+  const 回 = (res, o) => {
+    try {
+      res.setHeader?.('content-type', 'application/json; charset=utf-8')
+      res.end?.(JSON.stringify(o))
+    } catch (error) {}
+  }
+
+  const 读体 = async (req) => {
+    let body = ''
+    try {
+      for await (const chunk of req) body += chunk
+    } catch (error) {}
+    try {
+      return JSON.parse(body || '{}')
+    } catch (error) {
+      return {}
+    }
+  }
+
+  const 短id = (id) => {
+    const s = String(id)
+    return s.length <= 8 ? s : s.slice(-8)
+  }
+
+  /* 拿目标会话活着的 agent：带 / 不带 `session-` 前缀两个方向都试（照 speak-up 的写法）。 */
+  const 找agent = (id) => {
+    const 原 = String(id == null ? '' : id).trim()
+    if (原 === '') return undefined
+    const 候选 = [原]
+    if (原.startsWith('session-')) 候选.push(原.slice('session-'.length))
+    else 候选.push('session-' + 原)
+    for (const 一个 of 候选) {
+      try {
+        const a = ctx.agents.get(一个)
+        if (a !== undefined) return a
+      } catch (error) {}
+    }
+    return undefined
+  }
+
+  const 新id = () => {
+    try {
+      return randomUUID()
+    } catch (error) {
+      return 'qq-' + Date.now() + '-' + Math.random().toString(36).slice(2)
+    }
+  }
+
+  /** 手搓一条 user 消息（跟 speak-up 一样：role=user，source.kind 标成 qq，不冒充她亲手打的）。 */
+  const 手搓用户消息 = (文案) => ({
+    id: 新id(),
+    role: 'user',
+    content: [{ type: 'text', text: String(文案) }],
+    source: { kind: 'qq' },
+  })
+
+  /** 现在开着的会话清单（id + 标题），给设置页挑「目标会话」用 —— 不手填。 */
+  const 会话清单 = () => {
+    const 出 = []
+    // ⭐ 归档的会话不列（归档只是藏起来，list() 里还在 —— 得单独查 workspaceRegistry 的名单）
+    //   2026-10-20 修：以前完全不看归档，设置页里挑会话时混着一堆已经归档的
+    const 归档 = new Set()
+    try {
+      const 登记 = ctx.workspaceRegistry || ctx.get('workspaceRegistry')
+      for (const x of (登记 && 登记.archivedSessionIds) || []) 归档.add(String(x))
+    } catch (error) {}
+    try {
+      const 会话服务 = ctx.get('sessions')
+      const 标题服务 = ctx.get('sessionTitle')
+      if (会话服务 && typeof 会话服务.list === 'function') {
+        for (const s of 会话服务.list()) {
+          if (归档.has(String(s.id))) continue
+          let 标题 = ''
+          try {
+            const 快照 = 标题服务 && typeof 标题服务.get === 'function' ? 标题服务.get(s) : undefined
+            标题 = 快照 && 快照.title ? String(快照.title) : ''
+          } catch (error) {}
+          出.push({ id: String(s.id), 标题 })
+        }
+      }
+    } catch (error) {}
+    return 出
+  }
+
+  const 概况 = async () => {
+    const 配置 = 读配置()
+    const 清单 = 会话清单()
+    let NapCat状态 = null
+    try {
+      const r = await fetch(`${配置.NapCat}/get_login_info`, { method: 'POST', headers: 认证头(配置), body: '{}' })
+      const j = await r.json()
+      if (j && j.status === 'ok') NapCat状态 = { 用户: j.data.user_id, 昵称: j.data.nickname }
+    } catch (error) {
+      NapCat状态 = { 错: String((error && error.message) || error) }
+    }
+    return { ok: true, 版本, 配置, 配置文件, NapCat状态, 绑定: 绑定们(配置), 活着的会话: 清单, 目标情况: 配置.目标会话 && 清单.length ? 清单.filter((x) => 会话键(x.id) === 会话键(配置.目标会话)) : [], 日志 }
+  }
+
+  const 路线 = (路径, handler) =>
+    ctx.effect(() =>
+      ctx.webServer.register({
+        kind: 'exact',
+        path: 路径,
+        handler: async (req, res) => {
+          try {
+            await handler(req, res)
+          } catch (error) {
+            回(res, { ok: false, 说: String((error && error.message) || error) })
+          }
+        },
+      }),
+    )
+
+  路线(`${路由前缀}/state`, async (req, res) => {
+    await 读体(req)
+    回(res, await 概况())
+  })
+
+  路线(`${路由前缀}/save`, async (req, res) => {
+    const 来 = await 读体(req)
+    const 现在 = 读配置()
+    const 新 = { ...现在, ...(来 && typeof 来 === 'object' ? 来 : {}) }
+    const 洗好 = 归一化(新)
+    if (!写配置(洗好)) return 回(res, { ok: false, 说: `写不进配置文件：${配置文件}` })
+    const 状态 = 洗好.总开关 ? (洗好.试运行 ? '（只记账）' : '（真发）') : '（总开关关着）'
+    记账(`设置已保存：绑定 ${绑定们(洗好).length} 行（${绑定们(洗好).map((b) => b.名).join('、') || '无'}）｜总开关 ${洗好.总开关 ? '开' : '关'}${状态}`)
+    回(res, { ...(await 概况()), 说: '保存好了' })
+  })
+
+  // 收到 QQ 里你发来的话 → 喂进目标会话，让它照常开一轮。
+  // ⚠ 这是「QQ → DSH」那半的**入口函数**：一句正文（+ 图）→ agent.followup 走 DSH 自己的回合。
+  // ⭐ 2026-10-22：加了图片。图会先落一份到 `~/.dsh/qq-bridge-inbox/`，再把图交给 DSH 的
+  //    attachments；模型能看图就直接看，纯文本模型拿到的是一句占位文字 —— 所以文字里也写上本地路径。
+  // ── ⭐ 2026-10-24 主人要求：不许再要求「目标会话必须开着」 ──
+  let _文件系统 = null
+  const 文件系统 = async () => (_文件系统 || (_文件系统 = await import('node:fs')))
+  let 心跳时 = 0
+
+  /** 目标会话没活着就 resume 把它叫醒（照 DSH 会话控制器的做法）；返回 agent 或 undefined */
+  /** ⭐ 头一次到这间聊天来时：照预设开一间新会话 */
+async function 开一间() {
+  const 配置 = 读配置()
+  const 预设 = String(配置.预设 || 'whale')
+  const 目录 = String(配置.会话目录 || join(homedir(), '默认工作区', 'QQ消息'))
+  const id = 'session-' + randomUUID()
+  const 布置 = {}
+  try {
+    const 选 = ctx.agentDefaultModel && typeof ctx.agentDefaultModel.currentSelection === 'function' ? ctx.agentDefaultModel.currentSelection() : undefined
+    if (选 && 选.provider) 布置.agentOptions = { provider: 选.provider, model: 选.model }
+  } catch (error) {}
+  const 预设表 = typeof ctx.get === 'function' ? ctx.get('agentPresets') : undefined
+  if (预设表 && typeof 预设表.resolve === 'function' && typeof 预设表.mount === 'function') {
+    try {
+      const 定 = await 预设表.resolve(预设)
+      if (定 && 定.id) 布置.setup = async (agentCtx) => { await 预设表.mount(agentCtx, 定.id) }
+    } catch (error) { 记账(`预设挂不上（${预设}）：${String((error && error.message) || error).slice(0, 80)}`) }
+  }
+  try {
+    const 回 = await ctx.agents.create({ sessionId: id, meta: { cwd: 目录, agentPreset: 预设 }, ...布置 })
+    const agent = 回 && (回.agent || 回)
+    if (agent) { 记账(`新开了一间会话（${id}，预设 ${预设}，目录 ${目录}）`); return { agent, id } }
+    记账('开会话失败：create 没返回 agent')
+  } catch (error) {
+    记账(`开会话失败：${String((error && error.message) || error).slice(0, 140)}`)
+  }
+  return null
+}
+
+/** ⭐ 把绑定表里写着「新」的那行换成真正的会话号 */
+function 写回会话号(原串, 新号) {
+  try {
+    const 现 = 读配置()
+    const 表 = Array.isArray(现.绑定) ? JSON.parse(JSON.stringify(现.绑定)) : []
+    let 改过 = false
+    for (const b of 表) if (String(b.目标会话 || '') === String(原串 || '')) { b.目标会话 = 新号; 改过 = true }
+    if (改过) { 现.绑定 = 表; if (写配置(现)) 记账(`绑定表已写回新会话号（${新号}）`) }
+  } catch (error) { 记账(`写回会话号失败：${String((error && error.message) || error).slice(0, 100)}`) }
+}
+
+async function 叫醒(目标, 预设) {
+    const 原 = String(目标 == null ? '' : 目标).trim()
+    if (原 === '') return undefined
+    const 候选 = [原, 原.startsWith('session-') ? 原.slice('session-'.length) : 'session-' + 原]
+    let 选
+    try { if (ctx.agentDefaultModel && typeof ctx.agentDefaultModel.currentSelection === 'function') 选 = ctx.agentDefaultModel.currentSelection() } catch (error) {}
+    for (const id of 候选) {
+      try {
+        let 用预设 = 预设
+        try {
+          if (ctx.sessionQuery && typeof ctx.sessionQuery.observeSession === 'function') {
+            const 观 = await ctx.sessionQuery.observeSession(id, {})
+            const 头 = 观 && (观.header || (观.observation && 观.observation.header))
+            if (头) 用预设 = 用预设 || 头.preset || 头.agentPreset
+          }
+        } catch (error) { 记账(`看会话头失败（${id}）：${String((error && error.message) || error).slice(0, 80)}`) }
+        const 布置 = {}
+        if (选 && typeof 选 === 'object') 布置.agentOptions = 选
+        const 预设表 = typeof ctx.get === 'function' ? ctx.get('agentPresets') : undefined
+        if (预设表 && typeof 预设表.resolve === 'function' && typeof 预设表.mount === 'function') {
+          try {
+            const 定 = await 预设表.resolve(用预设)
+            if (定 && 定.id) 布置.setup = async (agentCtx) => { await 预设表.mount(agentCtx, 定.id) }
+          } catch (error) { 记账(`预设挂不上（${用预设 || '默认'}）：${String((error && error.message) || error).slice(0, 80)}`) }
+        }
+        const 回 = await ctx.agents.resume({ resumeSessionId: id, ...布置 })
+        const agent = 回 && (回.agent || 回)
+        if (agent) { 记账(`把目标会话叫醒了（${id}${用预设 ? '，预设 ' + 用预设 : ''}）`); return agent }
+        记账(`叫醒失败：resume 没返回 agent（${id}）`)
+      } catch (error) {
+        记账(`叫醒失败（${id}）：${String((error && error.message) || error).slice(0, 120)}`)
+      }
+    }
+    return undefined
+  }
+
+  async function 转入一条(文字, 图们, 消息id, 目标会话) {
+    const 配置 = 读配置()
+    const 原串 = String(目标会话 || 配置.目标会话 || '').trim()
+    const 要新建 = /^(新|new)(\s|:|$)/i.test(原串)   // ⭐ 目标会话写「新」= 头一次来时自动开一间
+    let 目标 = 要新建 ? '' : 原串
+    if (!目标 && !要新建) return { ok: false, 说: '还没选「目标会话」' }
+    if (!配置.总开关) return { ok: false, 说: '总开关关着，先打开' }
+    let agent = 目标 ? 找agent(目标) : undefined
+    if (!agent && 要新建) {
+      const 新 = await 开一间()
+      if (新) { 目标 = 新.id; agent = 新.agent; 写回会话号(原串, 新.id) }
+    }
+    if (!agent && 目标) agent = await 叫醒(目标)   // ⭐ 不再要求「会话开着」
+    if (!agent) return { ok: false, 说: `目标会话叫不醒（${短id(目标 || 原串)}）` }
+
+    // ── 收图：限量、限重，失败就跳过，不挡住文字 ──
+    const 收下 = []
+    if (配置.收图 && Array.isArray(图们) && 图们.length) {
+      const 上限 = Math.max(1, Math.min(Number(配置.收图最多) || 4, 10))
+      const 最大 = Math.max(1, Math.min(Number(配置.图上限MB) || 5, 30)) * 1024 * 1024
+      let 序 = 0
+      for (const 段 of 图们.slice(0, 上限)) {
+        序 += 1
+        const buf = await 取图字节(段 && 段.data ? 段.data : 段)
+        if (!buf || !buf.length) { 记账(`第 ${序} 张图下载失败，跳过`); continue }
+        if (buf.length > 最大) { 记账(`第 ${序} 张图太大（${Math.round(buf.length / 1048576)}MB），跳过`); continue }
+        const 类 = 看图类(buf)
+        收下.push({ 类, b64: buf.toString('base64'), 存: 存一张(`${消息id || 'qq'}-${序}`, buf, 类), 字节: buf.length })
+      }
+    }
+
+    const 原话 = String(文字 || '').trim()
+    const 谁 = String(配置.称呼 || '对方')
+    const 说明 = 收下.length
+      ? String.fromCharCode(10) + '（' + 谁 + '发了 ' + 收下.length + ' 张图：'
+        + 收下.map((x, i) => `第${i + 1}张 ${Math.round(x.字节 / 1024)}KB` + (x.存 ? `，要发回去就用 ${x.存}` : '')).join('；')
+        + '）'
+      : ''
+    const 文案 = (原话 || (收下.length ? '（' + 谁 + '发来了图片，没有配字）' : '')) + 说明
+    if (!文案) return { ok: false, 说: '这条既没文字也没图，不转' }
+
+    let content = [{ type: 'text', text: 文案 }]
+    if (收下.length) {
+      const 附件 = ctx.attachments || ctx.get('attachments')
+      if (附件 && typeof 附件.admitPromptContent === 'function') {
+        try {
+          const 待 = content.concat(收下.map((x, i) => ({
+            type: 'image', data: x.b64, mediaType: x.类, name: `qq-${消息id || 'x'}-${i + 1}.${扩展(x.类)}`,
+          })))
+          content = await 附件.admitPromptContent(待)
+          // ⭐ 记下「附件 id / DSH 那份只读副本 → 我们存的原图」，回发时换回原图（GIF 不会变静态 webp）
+          const 图块 = content.filter((x) => x && x.type === 'image' && x.attachment)
+          for (let i = 0; i < 图块.length && i < 收下.length; i++) {
+            let 副本 = ''
+            try { 副本 = typeof 附件.imageHostPath === 'function' ? String(附件.imageHostPath(图块[i].attachment) || '') : '' } catch (error) {}
+            记收图(图块[i].attachment && 图块[i].attachment.attachmentId, 副本, 收下[i].存)
+          }
+        } catch (error) {
+          记账('图交给 DSH 没成功（这轮只转文字）：' + String((error && error.message) || error))
+          content = [{ type: 'text', text: 文案 }]
+        }
+      } else {
+        记账('宿主没有 attachments 服务，图只能存本地（文字里已经给了路径）')
+      }
+    }
+
+    try {
+      // ⚠⚠ 必须 await：followup 返回 Promise。不接住的话，它 reject 时（会话半死 / agent 已释放）
+      //   catch 根本看不到（try 早就退出了）⇒ 未处理的 rejection ⇒ **整个 DSH 宿主退出**
+      //   （2026-10-21：speak-up 同一个坑已经被用户报成"装了鱼就死了"，这里一并修）
+      await agent.followup({ id: 新id(), role: 'user', content, source: { kind: 'qq' } })
+      try {
+        if (ctx.sessions && typeof ctx.sessions.flush === 'function') await ctx.sessions.flush(agent.session)
+      } catch (error) {}
+      const 图话 = 收下.length ? `（含 ${收下.length} 张图）` : ''
+      记账(`收到 QQ 里的${收下.length ? '图片' : '话'}${图话} → 转进 DSH：「${(原话 || '（没配字）').slice(0, 50)}${原话.length > 50 ? '…' : ''}」`)
+      return { ok: true, 说: '转进去了，它会照常开一轮' }
+    } catch (error) {
+      return { ok: false, 说: `followup 失败：${String((error && error.message) || error)}` }
+    }
+  }
+
+  /** 只要文字的那条老入口（给 /receive 路由和测试用） */
+  async function 转入文字(文字, 目标会话) {
+    return 转入一条(文字, [], '', 目标会话)
+  }
+
+  /**
+   * 轮询 NapCat 的 HTTP 历史接口，把「她新发的私聊 / 群消息」一条条转进 DSH。
+   * ⚠ 纯 HTTP 轮询：不连 WebSocket、不依赖 BOT。
+   * ⚠ 只认 `私聊QQ` 这个人发的（群也一样按这个号过滤），自己的回话不会自我繁殖。
+   */
+  async function 轮询收消息() {
+    const 配置 = 读配置()
+    // 总开关关 / 没选会话：只把「上次时间」推到此刻，别开的时候就补一大串旧的
+    const 表 = 绑定们(配置)
+    if (!配置.总开关 || !表.length) {
+      const 此刻 = Math.floor(Date.now() / 1000)
+      for (const k of Array.from(上次时间.keys())) 上次时间.set(k, 此刻)
+      return
+    }
+    // ⭐ 补投：上一轮没投进去的，趁目标会话活过来再试（等超过 10 分钟就放弃并记账）
+    if (待转.size) {
+      const 现在秒 = Math.floor(Date.now() / 1000)
+      for (const [漏id, 项] of Array.from(待转)) {
+        if (现在秒 - (项.首次 || 现在秒) > 600) {
+          待转.delete(漏id)
+          记账('放弃补投（等了超过 10 分钟）：「' + String(项.文字 || '').slice(0, 30) + '」')
+          continue
+        }
+        const 回执 = await 转入一条(项.文字, 项.图们, 漏id, 项.目标)
+        if (回执 && 回执.ok) {
+          待转.delete(漏id)
+          记账('✅ 补投成功：「' + String(项.文字 || '').slice(0, 30) + '」')
+        } else break
+      }
+    }
+    const 她的号 = Number(配置.私聊QQ) || 0
+    {
+      const 现在 = Math.floor(Date.now() / 1000)
+      if (现在 - 心跳时 > 900) { 心跳时 = 现在; 记账(`轮询在跑（${表.length} 个绑定，NapCat ${配置.NapCat}）`); void 认自己号() }
+    }
+
+    const 拉 = async (action, 体) => {
+      try {
+        const r = await fetch(`${配置.NapCat}/${action}`, {
+          method: 'POST', headers: 认证头(配置), body: JSON.stringify(体),
+        })
+        const j = await r.json()
+        return j && j.status === 'ok' && Array.isArray(j.data && j.data.messages) ? j.data.messages : []
+      } catch (error) {
+        return []
+      }
+    }
+    const 条转片段 = (条) => {
+      const 段们 = Array.isArray(条.message) ? 条.message : []
+      const 文字 = 段们.map((s) => (s && s.type === 'text' && s.data ? String(s.data.text) : (s && s.type === 'at' && s.data ? '@' + String(s.data.qq || '') + ' ' : ''))).join('').trim()
+      // ⭐ 图片 / 表情包都算图（表情包 mface 也带 url，能拿到字节）
+      const 图们 = 段们.filter((s) => s && s.data && (s.type === 'image' || s.type === 'mface'))
+      return { 文字, 图们 }
+    }
+
+    for (const 绑 of 表) {
+      if (!绑.收) continue
+      const 是群 = 绑.类型 === 'group'
+      const 键 = 绑.类型 + ':' + 绑.号
+      const 认 = Number(绑.只认 || (是群 ? 配置.私聊QQ : 绑.号)) || 0
+      if (!上次时间.has(键)) 上次时间.set(键, Math.floor(Date.now() / 1000) - Math.max(0, Math.min(Number(配置.回看秒) || 300, 3600)))
+      const 列表 = await 拉(是群 ? 'get_group_msg_history' : 'get_friend_msg_history',
+        是群 ? { group_id: Number(绑.号), count: 30 } : { user_id: Number(绑.号), count: 10 })
+      for (const 条 of 列表.sort((a, b) => (a.time || 0) - (b.time || 0))) {
+        if (!条) continue
+        if (自己发的.has(String(条.message_id))) continue // ⭐ 这是我们自己发出去的话（回声），不收
+        if (自己号 && Number(条.user_id) === 自己号) continue // ⭐ 兜底：本机这个 QQ 号发的话一律不收
+        if (认 && Number(条.user_id) !== 认) continue
+        if ((条.time || 0) < (上次时间.get(键) || 0)) continue
+        if (已转消息.has(String(条.message_id))) continue
+        上次时间.set(键, 条.time || 上次时间.get(键))
+        const { 文字, 图们 } = 条转片段(条)
+        已转消息.add(String(条.message_id))
+        // 纯表情（没图没字）就别转了，记掉别再反复拉
+        if (!文字 && !图们.length) continue
+        // ⭐ 潜水行：群里没点名就当没看见
+        if (是群 && 绑.收档 === '半收' && !点名了(文字, 配置.称呼) && !最近说过话(绑)) { 记账('「' + 绑.名 + '」群里这句没点名、也不是接着它说的话（半收）→ 不投'); continue }
+        // ⭐ v13（2026-10-24）：删掉「潜水」那道独立闸门 —— 它让 收档=全收 也照样被按死
+        //   （群里的图/表情没字就永远过不来）。现在**只看收档**：点名=只收点名的；半收=点名+接着它说的话；全收=什么都收。
+        //   潜水 只作为「没显式填收档时的默认值」（点名）留在 绑定们() 里。
+        const 回执 = await 转入一条(绑.自动发 === false ? 加提示(文字, 绑) : 文字, 图们, 条.message_id, 绑.目标会话)
+        if (!回执 || !回执.ok) {
+          记账('没投进去（' + 绑.名 + '）：' + String((回执 && 回执.说) || '未知') + ' —— 先存着，等它活过来补投')
+          待转.set(String(条.message_id), { 文字, 图们, 目标: 绑.目标会话, 首次: 条.time || Math.floor(Date.now() / 1000) })
+        }
+      }
+    }
+
+
+    存状态()
+    if (已转消息.size > 1000) {
+      const 全 = [...已转消息]
+      已转消息.clear()
+      for (const x of 全.slice(全.length - 600)) 已转消息.add(x)
+    }
+  }
+
+  路线(`${路由前缀}/receive`, async (req, res) => {
+    const 来 = await 读体(req)
+    const 文字 = typeof 来.text === 'string' ? 来.text.trim() : ''
+    if (!文字) return 回(res, { ok: false, 说: '没有文字（body 里给 text）' })
+    const 指定 = typeof 来.目标会话 === 'string' && 来.目标会话.trim() ? 来.目标会话.trim() : ''
+    回(res, await 转入文字(文字, 指定 || (绑定们(读配置())[0] || {}).目标会话))
+  })
+
+  // 只开一间会话（不投东西）：绑定表里写「新」的行会自动认领
+  路线(`${路由前缀}/new-session`, async (req, res) => {
+    await 读体(req)
+    const 新 = await 开一间()
+    if (!新) return 回(res, { ok: false, 说: '没开成，看日志' })
+    写回会话号('新', 新.id)
+    回(res, { ok: true, 说: '开好了，并把绑定表里写「新」的行认给了它', 会话: 新.id })
+  })
+
+  // 手动试一发：**真发**（绕过试运行），只发一条固定测试句，动不了已发轮
+  路线(`${路由前缀}/test-send`, async (req, res) => {
+    await 读体(req)
+    const 配置 = 读配置()
+    const 绑 = 绑定们(配置).find((b) => b.发) || null
+    if (!绑) return 回(res, { ok: false, 说: '绑定表里没有可发的行，先去设置里加一行' })
+    const 文字 = '（这是一条测试消息：DSH → QQ 通了）'
+    const 结果 = await 发到QQ(配置, 绑, 文字)
+    const 全过 = 结果.length > 0 && 结果.every((r) => r.ok)
+    记账(`手动测试：${全过 ? '✅ 已发' : '⚠ 有问题'}「${文字}」`)
+    for (const r of 结果) if (!r.ok) 记账(`   ${r.action} 失败：${JSON.stringify(r.数据).slice(0, 140)}`)
+    回(res, { ok: 全过, 说: 全过 ? '测试句已经发到 QQ 了' : '有一步没发出去（看下面的记录）', 记录: 日志 })
+  })
+
+  // ---------- 挂监听 ----------
+
+  ctx.effect(() => {
+    const 摘 = ctx.on('session/event', (session, event) => {
+      try {
+        收到事件(session, event)
+      } catch (error) {
+        记账(`转发时出错：${String((error && error.message) || error)}`)
+      }
+    })
+    return () => {
+      try {
+        if (typeof 摘 === 'function') 摘()
+      } catch (error) {}
+    }
+  }, 'qq-bridge: 盯伙伴说话')
+
+  // 轮询 NapCat 收「她新发的 QQ」→ 转进 DSH（QQ → DSH 这半，不赖 BOT）
+  ctx.effect(() => {
+    if (typeof ctx.interval !== 'function') {
+      记账('拿不到 timer（ctx.interval 不在）—— QQ → DSH 的轮询收消息跑不起来，但 DSH → QQ 照常能用')
+      return () => {}
+    }
+    const 停 = ctx.interval(() => {
+      void 轮询收消息().catch((error) => {
+        try { ctx.logger?.info(`qq-bridge: 轮询出错：${String((error && error.message) || error)}`) } catch (e2) {}
+      })
+    }, 4000)
+    return () => {
+      try {
+        if (typeof 停 === 'function') 停()
+      } catch (error) {}
+    }
+  }, 'qq-bridge: 轮询收 QQ 消息')
+
+  // ⭐ 2026-10-24：给她/他一个「发到 QQ」的工具 —— 不调它就不发话（群里自主决定的关键）
+  try {
+    if (ctx.tools && typeof ctx.tools.register === 'function') {
+      const 定义 = {
+        name: 'qq_say',
+        description: '把一句话（可带图）发到 QQ（私聊或群）。这是你唯一对外的说话渠道：不调用它，就不会有任何话发出去；想沉默就别调用。',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            text: { type: 'string', description: '要发到 QQ 的正文（原样发出去，别带 markdown 标记）。' },
+            images: { type: 'array', items: { type: 'string' }, description: '可选：一起发出去的本地图片路径。' },
+            to: { type: 'string', description: '可选：只发给某条绑定的名字（默认＝本会话绑定的全部 QQ）。' },
+          },
+          required: ['text'],
+        },
+        output: {
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              ok: { type: 'boolean' },
+              送去: { type: 'array', items: { type: 'string' } },
+              说: { type: 'string' },
+            },
+            required: ['ok', '送去', '说'],
+          },
+          // ⭐ 契约：render 必须返回 ContentBlock[]；返回裸字符串就会 content.some is not a function
+          render: (参数, 值) => [{ type: 'text', text: String((值 && 值.说) || '已发到 QQ') }],
+        },
+        execute: async (参数, exec) => {
+          const 配置 = 读配置()
+          if (配置.总开关 !== true) return { ok: false, 送去: [], 说: '总开关关着，没发' }
+          // ⭐ DSH 的 exec 不带 sessionId，只有 exec.agent；会话号在 agent.session.id 上 —— 多探几处，挑能对上绑定的那个
+          const 候选 = []
+          try { if (exec && typeof exec.sessionId === 'string') 候选.push(exec.sessionId) } catch (错误) {}
+          try { if (exec && exec.agent && exec.agent.session && typeof exec.agent.session.id === 'string') 候选.push(exec.agent.session.id) } catch (错误) {}
+          try { if (exec && exec.agent && typeof exec.agent.id === 'string') 候选.push(exec.agent.id) } catch (错误) {}
+          const 表 = 绑定们(配置)
+          let 目标们 = []
+          for (const 名 of 候选) {
+            const 命中 = 表.filter((b) => 会话键(b.目标会话) === 会话键(名) && b.发 !== false && (!参数.to || b.名 === 参数.to))
+            if (命中.length) { 目标们 = 命中; break }
+          }
+          if (!目标们.length && 参数.to) 目标们 = 表.filter((b) => b.名 === 参数.to && b.发 !== false)
+          if (!目标们.length) {
+            记账('qq_say：找不到绑定（会话候选=' + JSON.stringify(候选) + '；绑定目标=' + JSON.stringify(表.map((b) => b.目标会话)) + '）')
+            return { ok: false, 送去: [], 说: '这间会话没有绑定到任何 QQ（或那行「发」关着），没地方发' }
+          }
+          const 送去 = []
+          for (const 绑 of 目标们) {
+            try {
+              const 结果 = await 发到QQ(配置, 绑, String(参数.text || ''), Array.isArray(参数.images) ? 参数.images : [])
+              const 成 = 结果.filter((r) => r.ok).length > 0
+              if (成) 记出声(绑)
+              送去.push(绑.名 + (成 ? '（发了）' : '（没发成）'))
+            } catch (错误) {
+              送去.push(绑.名 + '（出错：' + String((错误 && 错误.message) || 错误) + '）')
+            }
+          }
+          const 全成 = 送去.length > 0 && 送去.every((x) => x.indexOf('（发了）') >= 0)
+          记账('qq_say：' + (全成 ? '✅ 它自己决定发了' : '⚠ 有问题') + ' → ' + 送去.join('、'))
+          return { ok: 全成, 送去, 说: 全成 ? '发出去了' : '没发成，看看桥的日志' }
+        },
+      }
+      const 注册 = () => ctx.tools.register(定义)
+      if (typeof ctx.effect === 'function') ctx.effect(function* () { yield 注册() })
+      else 注册()
+      记账('已注册工具 qq_say（想说话才调它）')
+    } else {
+      记账('宿主没给 tools 服务：qq_say 注册不了（群里只能靠自动发）')
+    }
+  } catch (错误) {
+    记账('注册 qq_say 失败：' + String((错误 && 错误.message) || 错误))
+  }
+
+  记账(`已装好 v${版本}：DSH↔QQ 两半都在｜总开关 ${读配置().总开关 ? '开' : '关'}｜试运行 ${读配置().试运行 ? '开（只记账）' : '关（真发）'}｜收消息 4 秒轮询一次`)
+
+  return { 记账, 概况, 落地一发, 发到QQ, 收到事件, 日志 }
+}
